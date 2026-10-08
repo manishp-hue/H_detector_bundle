@@ -1,3 +1,0 @@
-/home/gw_jetson_01/NEWSPACE_AIR_PORTABLE/build/CMakeFiles/publisher_node.dir
-/home/gw_jetson_01/NEWSPACE_AIR_PORTABLE/build/CMakeFiles/edit_cache.dir
-/home/gw_jetson_01/NEWSPACE_AIR_PORTABLE/build/CMakeFiles/rebuild_cache.dir
