@@ -3,3 +3,12 @@
 build/
 __pycache__/
 *.pyc
+
+# Exclude AI models
+NEWSPACE_AIR_PORTABLE/models/
+
+# Exclude generated files
+*.plan
+build/
+__pycache__/
+*.pyc
