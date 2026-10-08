@@ -1,0 +1,7 @@
+Created: 2026-10-05T12:29:18+05:30
+Source host: gw-jetson-01
+Architecture: aarch64
+Kernel: 5.15.199-tegra
+L4T: # R36 (release), REVISION: 5.2, GCID: 46426093, BOARD: generic, EABI: aarch64, DATE: Thu Jul 16 18:56:22 UTC 2026
+nvidia-l4t-core: 36.5.2-20260716114719
+libnvinfer10: 10.3.0.30-1+cuda12.5

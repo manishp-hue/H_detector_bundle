@@ -1,0 +1,18 @@
+Created: 2026-10-05T12:57:41+05:30
+Source directory: /home/manish/newspace_ground_fresh
+
+OS:
+PRETTY_NAME="Ubuntu 24.04.5 LTS"
+VERSION_ID="24.04"
+
+Kernel:
+Linux NRT-BLR-LT-568 7.0.0-34-generic #34~24.04.1-Ubuntu SMP PREEMPT_DYNAMIC Fri Sep  4 15:38:29 UTC 2 x86_64 x86_64 x86_64 GNU/Linux
+
+CMake:
+cmake version 3.28.3
+
+Qt:
+6.4.2
+
+GStreamer:
+gst-launch-1.0 version 1.24.2
