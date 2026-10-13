@@ -1,34 +1,61 @@
 #!/usr/bin/env bash
+# NEWSPACE_ALWAYS_ON_IMX477_V2 - Newspace uses the existing camera owner.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CORE="$ROOT/run_core.sh"
 cd "$ROOT"
+UNIT="imx477-camera.service"
+STATE="/run/newspace-imx477/status.json"
+SOCKET="/run/newspace-imx477/frames.sock"
 
-DINO="$ROOT/models/gdino/grounding_dino_fixed.plan"
-SAM="$ROOT/models/sam2_box.plan"
-BIN="$ROOT/build/publisher_node"
-
-[[ -f "$DINO" ]] || { echo "ERROR: missing $DINO" >&2; exit 3; }
-[[ -f "$SAM" ]] || { echo "ERROR: missing $SAM" >&2; exit 3; }
-
-if [[ ! -x "$BIN" ]]; then
-    echo "[PORTABLE] publisher_node is not built; rebuilding for this Jetson..."
-    JOBS="${JOBS:-2}" "$ROOT/build.sh"
+if [[ ! -x "$CORE" ]]; then
+  echo "[NEWSPACE] ERROR: missing original launcher: $CORE" >&2
+  exit 21
 fi
 
-# IMPORTANT: publisher_node itself is always headless.  Use local_viewer.sh or
-# run_local_display.sh for a Jetson-local final detection window.  This prevents
-# an X11 failure from killing control, CSI, detection and RTSP.
-exec "$BIN" \
-  --sensor-id "${SENSOR_ID:-0}" \
-  --width "${WIDTH:-1920}" \
-  --height "${HEIGHT:-1080}" \
-  --fps "${FPS:-60}" \
-  --stream-width "${STREAM_WIDTH:-1280}" \
-  --stream-height "${STREAM_HEIGHT:-720}" \
-  --stream-fps "${STREAM_FPS:-30}" \
-  --bitrate "${VIDEO_BITRATE_KBPS:-3000}" \
-  --control-port "${CONTROL_PORT:-5701}" \
-  --rtsp-port "${RTSP_PORT:-8554}" \
-  --local-display off \
-  --dino-plan "$DINO" \
-  --sam-plan "$SAM"
+# V5 publishes 1080p/60 I420. Air stream output settings remain independent.
+if [[ "${SENSOR_ID:-0}" != "0" || "${WIDTH:-1920}" != "1920" || \
+      "${HEIGHT:-1080}" != "1080" || "${FPS:-60}" != "60" ]]; then
+  echo "[NEWSPACE] ERROR: V5 requires SENSOR_ID=0 WIDTH=1920 HEIGHT=1080 FPS=60" >&2
+  exit 22
+fi
+
+# A single, long-lived systemd owner must be active. NEVER restart Argus here.
+if ! systemctl is-active --quiet "$UNIT"; then
+  echo "[NEWSPACE] ERROR: $UNIT is not active. Check imx477ctl status" >&2
+  exit 23
+fi
+
+# Camera-first check, bounded to 5 seconds. The camera owner already runs at boot.
+ready=0
+for _ in 1 2 3 4 5; do
+  if /usr/bin/python3 - "$STATE" "$SOCKET" <<'PY_CHECK'
+import json, os, pathlib, stat, sys, time
+p=pathlib.Path(sys.argv[1]); sock=pathlib.Path(sys.argv[2])
+try:
+    obj=json.loads(p.read_text())
+    age=time.time()-float(obj['updated_unix'])
+    if not (0 <= age <= 5 and obj['status']=='healthy'
+            and float(obj.get('capture_fps',0)) >= 1
+            and float(obj.get('output_fps',0)) >= 1
+            and sock.is_socket() and os.access(sock,os.R_OK|os.W_OK)):
+        sys.exit(1)
+except (OSError, ValueError, TypeError, KeyError):
+    sys.exit(1)
+PY_CHECK
+  then ready=1; break; fi
+  sleep 1
+done
+
+if [[ "$ready" != "1" ]]; then
+  echo "[NEWSPACE] ERROR: V5 is not healthy / its SHM socket is unavailable." >&2
+  imx477ctl status || true
+  echo "[NEWSPACE] Do NOT start another nvarguscamerasrc. Check the V5 service." >&2
+  exit 24
+fi
+
+# Detection ON/OFF now opens/closes ONLY an SHM reader. V5 CSI stays alive.
+echo "[NEWSPACE] INPUT: always-on IMX477 V5, SHM $SOCKET (I420 1080p60)"
+echo "[NEWSPACE] CAMERA OWNER: $UNIT - no Argus restart or CSI re-probe"
+echo "[NEWSPACE] AIR controls/AI/tracker/RTSP remain unchanged"
+exec "$CORE" "$@"

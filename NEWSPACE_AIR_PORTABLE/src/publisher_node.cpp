@@ -12,6 +12,8 @@
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/file.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -33,6 +35,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <stdexcept>
 
@@ -46,6 +49,30 @@ using helipad::VisionConfig;
 
 volatile std::sig_atomic_t g_stop = 0;
 void onSignal(int) { g_stop = 1; }
+
+class SingleInstanceLock {
+    int fd_ = -1;
+public:
+    bool acquire(const char* path) {
+        fd_ = ::open(path, O_CREAT | O_RDWR, 0666);
+        if (fd_ < 0) return false;
+        if (::flock(fd_, LOCK_EX | LOCK_NB) != 0) {
+            ::close(fd_);
+            fd_ = -1;
+            return false;
+        }
+        ::ftruncate(fd_, 0);
+        const std::string pid = std::to_string(::getpid()) + "\n";
+        (void)::write(fd_, pid.data(), pid.size());
+        return true;
+    }
+    ~SingleInstanceLock() {
+        if (fd_ >= 0) {
+            (void)::flock(fd_, LOCK_UN);
+            ::close(fd_);
+        }
+    }
+};
 
 std::uint64_t monoMs() {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -113,14 +140,21 @@ bool parseArgs(int argc, char** argv, Config& c) {
 }
 
 std::string mipiPipeline(const Config& c) {
-    return "nvarguscamerasrc sensor-id=" + std::to_string(c.sensorId) +
-        " ! video/x-raw(memory:NVMM),width=" + std::to_string(c.width) +
-        ",height=" + std::to_string(c.height) +
-        ",framerate=" + std::to_string(c.fps) + "/1,format=NV12 "
-        "! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "
-        "! nvvidconv ! video/x-raw,format=BGRx "
-        "! videoconvert n-threads=2 ! video/x-raw,format=BGR "
-        "! appsink drop=true max-buffers=1 sync=false";
+    // NEWSPACE_ALWAYS_ON_IMX477_V2
+    // The V5 systemd owner is the ONLY process opening nvarguscamerasrc.
+    // This function keeps its old name for existing publisher call sites.
+    // Source: /run/newspace-imx477/frames.sock (I420, 1920x1080, 60 FPS).
+    // Output: BGR for unchanged OpenCV detector / tracking / TensorRT code.
+    if (c.sensorId != 0 || c.width != 1920 || c.height != 1080 || c.fps != 60) {
+        throw std::runtime_error(
+            "Always-on IMX477 V5 fixed input: sensor 0, 1920x1080, 60 FPS");
+    }
+    return "shmsrc socket-path=/run/newspace-imx477/frames.sock "
+           "is-live=true do-timestamp=true "
+           "! video/x-raw,format=I420,width=1920,height=1080,framerate=60/1 "
+           "! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream "
+           "! videoconvert n-threads=2 ! video/x-raw,format=BGR "
+           "! appsink drop=true max-buffers=1 sync=false";
 }
 
 const char* stateName(TrackState s) {
@@ -409,6 +443,35 @@ public:
     void put(const cv::Mat& f,std::uint64_t seq){std::lock_guard<std::mutex> l(mutex_);frame_=f;seq_=seq;}
     bool get(cv::Mat& f,std::uint64_t& seq) const {std::lock_guard<std::mutex> l(mutex_);if(frame_.empty())return false;f=frame_;seq=seq_;return true;}
     void clear(){std::lock_guard<std::mutex> l(mutex_);frame_.release();seq_=0;}
+};
+
+// CAPTURE_WORKER_R5: dedicated CSI ownership + latest-raw-frame overwrite slot.
+// The camera thread never waits for detector/AI/annotation/RTSP work.  A new
+// camera frame replaces the previous unprocessed frame so latency cannot build
+// as a FIFO backlog.  cv::Mat move/refcount semantics avoid an extra 1080p copy.
+class LatestRawFrame {
+    mutable std::mutex mutex_;
+    cv::Mat frame_;
+    std::uint64_t seq_=0;
+public:
+    void put(cv::Mat&& f,std::uint64_t seq){
+        if(f.empty()) return;
+        std::lock_guard<std::mutex> l(mutex_);
+        frame_=std::move(f);
+        seq_=seq;
+    }
+    bool get(cv::Mat& f,std::uint64_t& seq) const {
+        std::lock_guard<std::mutex> l(mutex_);
+        if(frame_.empty()) return false;
+        f=frame_;              // shallow cv::Mat handoff; buffer stays ref-counted
+        seq=seq_;
+        return true;
+    }
+    void clear(){
+        std::lock_guard<std::mutex> l(mutex_);
+        frame_.release();
+        seq_=0;
+    }
 };
 
 struct Telemetry {
@@ -721,6 +784,15 @@ int main(int argc,char** argv){
     Config cfg;
     try{if(!parseArgs(argc,argv,cfg))return 0;}catch(const std::exception& e){std::cerr<<e.what()<<"\n";usage(argv[0]);return 2;}
 
+    // CAMERA_GUARD_R3: one AIR publisher owns the CSI/RTSP/control stack.
+    // This prevents a leftover systemd/manual instance from competing for Argus.
+    SingleInstanceLock instanceLock;
+    if(!instanceLock.acquire("/tmp/newspace_air_publisher.lock")){
+        std::cerr<<"[AIR] REFUSING START: another publisher_node instance is already running.\n"
+                 <<"[AIR] Check: pgrep -af publisher_node\n";
+        return 10;
+    }
+
     std::atomic<bool> detRequest{false},aiRequest{false},detActive{false},streamReady{false};
     LatestFrame latest; Telemetry telemetry; std::condition_variable wake; std::mutex wakeMutex;
     RtspServer rtsp(cfg,latest,streamReady);
@@ -728,76 +800,428 @@ int main(int argc,char** argv){
     ControlServer control(cfg,detRequest,aiRequest,telemetry,wake,wakeMutex); control.start();
     std::cout<<"[AIR] publisher_node ready. Detection starts only after DET 1.\n";
     std::cout<<"[AIR] RTSP rtsp://<jetson>:"<<cfg.rtspPort<<"/main.264 (TCP only)\n";
+    std::cout<<"[AIR] CAMERA_GUARD_R3: single-instance + no automatic CSI reopen after a camera fault\n";
+    std::cout<<"[AIR] CAPTURE_WORKER_R5: dedicated CSI thread + depth-1 latest RAW frame slot\n";
 
     const bool preview=localDisplayWanted(cfg);
     std::unique_ptr<AsyncLocalDisplay> localDisplay;
+
     while(!g_stop){
         if(!detRequest.load()){
-            std::unique_lock<std::mutex> l(wakeMutex);wake.wait_for(l,250ms,[&]{return g_stop||detRequest.load();});continue;
+            std::unique_lock<std::mutex> l(wakeMutex);
+            wake.wait_for(l,250ms,[&]{return g_stop||detRequest.load();});
+            continue;
         }
-        std::cout<<"[VISION] DET ON: opening CSI and detector\n";
+
+        // ================================================================
+        // CAMERA-FIRST R4
+        //
+        // Priority:
+        //   1. Open CSI/Argus.
+        //   2. Start the dedicated capture worker immediately.
+        //   3. Prove continuous valid camera data for 3 seconds.
+        //   4. ONLY THEN construct detector and deserialize TensorRT.
+        //
+        // IMPORTANT:
+        // The camera worker keeps draining CSI while TensorRT is loading.
+        // ================================================================
+        std::cout<<"[VISION] DET ON: CAMERA FIRST - opening CSI before detector/TensorRT\n";
+
         cv::VideoCapture cap(mipiPipeline(cfg),cv::CAP_GSTREAMER);
+
         if(!cap.isOpened()){
-            std::cerr<<"[VISION] CSI open failed; retrying while DET remains ON\n";
-            {std::lock_guard<std::mutex> l(telemetry.mutex);telemetry.detActive=false;telemetry.state="CAMERA_ERROR";++telemetry.seq;}
-            std::this_thread::sleep_for(1s);continue;
+            std::cerr<<"[VISION] CAMERA FAULT: CSI open failed. Automatic reopen is DISABLED.\n"
+                     <<"[VISION] Detection has been latched OFF. Recover Argus if needed, then command DET ON again.\n";
+
+            detRequest.store(false);
+            aiRequest.store(false);
+            streamReady.store(false);
+            latest.clear();
+            rtsp.resetClients();
+
+            {
+                std::lock_guard<std::mutex> l(telemetry.mutex);
+                ++telemetry.seq;
+                telemetry.detActive=false;
+                telemetry.aiRequested=false;
+                telemetry.aiReady=false;
+                telemetry.aiActive=false;
+                telemetry.targetValid=false;
+                telemetry.streamReady=false;
+                telemetry.x=telemetry.y=0;
+                telemetry.procFps=0;
+                telemetry.sourceFps=cfg.fps;
+                telemetry.frameNo=0;
+                telemetry.state="CAMERA_ERROR";
+            }
+
+            std::this_thread::sleep_for(750ms);
+            continue;
         }
-        auto tracker=std::make_unique<HelipadTracker>(makeConfig(cfg.width,cfg.fps));
+
+        {
+            std::lock_guard<std::mutex> l(telemetry.mutex);
+            ++telemetry.seq;
+            telemetry.detActive=false;
+            telemetry.aiRequested=false;
+            telemetry.aiReady=false;
+            telemetry.aiActive=false;
+            telemetry.targetValid=false;
+            telemetry.streamReady=false;
+            telemetry.x=telemetry.y=0;
+            telemetry.procFps=0;
+            telemetry.sourceFps=cfg.fps;
+            telemetry.frameNo=0;
+            telemetry.state="CAMERA_CHECK";
+        }
+
+        LatestRawFrame rawLatest;
+        std::atomic<bool> captureRunning{true};
+        std::atomic<bool> cameraFault{false};
+        std::atomic<std::uint64_t> capturedSeq{0};
+
+        if(preview)
+            localDisplay=std::make_unique<AsyncLocalDisplay>();
+
+        std::cout<<"[CAM] dedicated CSI capture worker START (camera priority)\n";
+
+        std::thread cameraThread([&]{
+            while(captureRunning.load(std::memory_order_acquire) &&
+                  !g_stop &&
+                  detRequest.load(std::memory_order_acquire))
+            {
+                cv::Mat captured;
+
+                if(!cap.read(captured) || captured.empty()){
+                    cameraFault.store(true,std::memory_order_release);
+                    captureRunning.store(false,std::memory_order_release);
+                    detRequest.store(false,std::memory_order_release);
+                    aiRequest.store(false,std::memory_order_release);
+
+                    std::cerr<<"[CAM] CAMERA FAULT: CSI frame read failed.\n"
+                             <<"[CAM] capture worker stopped; NO automatic CSI restart will be attempted.\n";
+                    break;
+                }
+
+                if(captured.cols!=cfg.width ||
+                   captured.rows!=cfg.height ||
+                   captured.type()!=CV_8UC3)
+                {
+                    cameraFault.store(true,std::memory_order_release);
+                    captureRunning.store(false,std::memory_order_release);
+                    detRequest.store(false,std::memory_order_release);
+                    aiRequest.store(false,std::memory_order_release);
+
+                    std::cerr<<"[CAM] CAMERA FAULT: invalid frame contract "
+                             <<captured.cols<<"x"<<captured.rows
+                             <<" type="<<captured.type()
+                             <<" expected "<<cfg.width<<"x"<<cfg.height
+                             <<" CV_8UC3\n";
+                    break;
+                }
+
+                const std::uint64_t seq=
+                    capturedSeq.fetch_add(1,std::memory_order_acq_rel)+1;
+
+                rawLatest.put(std::move(captured),seq);
+
+                if(seq==1)
+                    std::cout<<"[CAM] first CSI frame RECEIVED by dedicated worker\n";
+            }
+
+            std::cout<<"[CAM] dedicated CSI capture worker STOP\n";
+        });
+
+        std::cout<<"[VISION] CAMERA CHECK: waiting for first valid CSI frame\n";
+
+        bool cameraHealthy=false;
+        const auto cameraOpenTime=std::chrono::steady_clock::now();
+        std::chrono::steady_clock::time_point firstGoodTime{};
+        bool firstGoodSeen=false;
+
+        while(!g_stop &&
+              detRequest.load(std::memory_order_acquire) &&
+              !cameraFault.load(std::memory_order_acquire))
+        {
+            const auto now=std::chrono::steady_clock::now();
+            const std::uint64_t seq=
+                capturedSeq.load(std::memory_order_acquire);
+
+            if(!firstGoodSeen && seq>0){
+                firstGoodSeen=true;
+                firstGoodTime=now;
+                std::cout<<"[VISION] CAMERA CHECK: first valid frame confirmed; validating 3 s continuous data\n";
+            }
+
+            if(firstGoodSeen){
+                const double goodSeconds=
+                    std::chrono::duration<double>(now-firstGoodTime).count();
+
+                if(goodSeconds>=3.0){
+                    const std::uint64_t frames=
+                        capturedSeq.load(std::memory_order_acquire);
+
+                    if(frames>=90){
+                        cameraHealthy=true;
+                        std::cout<<"[VISION] CAMERA CHECK PASS: "
+                                 <<goodSeconds<<" s continuous, "
+                                 <<frames<<" valid frames received\n";
+                    }else{
+                        std::cerr<<"[VISION] CAMERA CHECK FAIL: only "
+                                 <<frames<<" frames received during health window\n";
+                    }
+                    break;
+                }
+            }else{
+                const double waitSeconds=
+                    std::chrono::duration<double>(now-cameraOpenTime).count();
+
+                if(waitSeconds>=5.0){
+                    std::cerr<<"[VISION] CAMERA CHECK FAIL: no valid CSI frame within 5 s\n";
+                    cameraFault.store(true,std::memory_order_release);
+                    detRequest.store(false,std::memory_order_release);
+                    aiRequest.store(false,std::memory_order_release);
+                    break;
+                }
+            }
+
+            std::this_thread::sleep_for(10ms);
+        }
+
+        if(!cameraHealthy){
+            captureRunning.store(false,std::memory_order_release);
+
+            if(cameraThread.joinable())
+                cameraThread.join();
+
+            cap.release();
+            streamReady.store(false);
+            latest.clear();
+            rtsp.resetClients();
+
+            {
+                std::lock_guard<std::mutex> l(telemetry.mutex);
+                ++telemetry.seq;
+                telemetry.detActive=false;
+                telemetry.aiRequested=false;
+                telemetry.aiReady=false;
+                telemetry.aiActive=false;
+                telemetry.targetValid=false;
+                telemetry.streamReady=false;
+                telemetry.x=telemetry.y=0;
+                telemetry.procFps=0;
+                telemetry.sourceFps=cfg.fps;
+                telemetry.frameNo=0;
+                telemetry.state=
+                    cameraFault.load(std::memory_order_acquire)
+                        ? "CAMERA_ERROR"
+                        : "OFF";
+            }
+
+            if(cameraFault.load(std::memory_order_acquire))
+                std::cout<<"[VISION] TensorRT NOT loaded because CAMERA CHECK failed\n";
+
+            continue;
+        }
+
+        std::cout<<"[VISION] CAMERA FIRST PASS: camera remains live; now starting detector/TensorRT\n";
+
+        auto tracker=
+            std::make_unique<HelipadTracker>(
+                makeConfig(cfg.width,cfg.fps));
+
         bool aiReady=false;
-        if(!cfg.dinoPlan.empty()&&!cfg.samPlan.empty()&&std::filesystem::exists(cfg.dinoPlan)&&std::filesystem::exists(cfg.samPlan)){
-            std::cout<<"[AI] Loading TensorRT engines once for this Detection session...\n";
+
+        if(!cfg.dinoPlan.empty() &&
+           !cfg.samPlan.empty() &&
+           std::filesystem::exists(cfg.dinoPlan) &&
+           std::filesystem::exists(cfg.samPlan))
+        {
+            std::cout<<"[AI] Loading TensorRT engines AFTER camera health PASS...\n";
             aiReady=tracker->setAiEngines(cfg.dinoPlan,cfg.samPlan);
             std::cout<<"[AI] engines "<<(aiReady?"READY":"UNAVAILABLE")<<"\n";
         }
+
         tracker->setAiEnabled(false);
+
+        if(g_stop ||
+           !detRequest.load(std::memory_order_acquire) ||
+           cameraFault.load(std::memory_order_acquire))
+        {
+            tracker->setAiEnabled(false);
+            tracker.reset();
+
+            captureRunning.store(false,std::memory_order_release);
+            if(cameraThread.joinable())
+                cameraThread.join();
+
+            cap.release();
+            streamReady.store(false);
+            latest.clear();
+            rtsp.resetClients();
+
+            {
+                std::lock_guard<std::mutex> l(telemetry.mutex);
+                ++telemetry.seq;
+                telemetry.detActive=false;
+                telemetry.aiRequested=false;
+                telemetry.aiReady=false;
+                telemetry.aiActive=false;
+                telemetry.targetValid=false;
+                telemetry.streamReady=false;
+                telemetry.x=telemetry.y=0;
+                telemetry.procFps=0;
+                telemetry.sourceFps=cfg.fps;
+                telemetry.frameNo=0;
+                telemetry.state=
+                    cameraFault.load(std::memory_order_acquire)
+                        ? "CAMERA_ERROR"
+                        : "OFF";
+            }
+
+            continue;
+        }
+
         detActive=true;
-        {std::lock_guard<std::mutex> l(telemetry.mutex);telemetry.detActive=true;telemetry.aiReady=aiReady;telemetry.sourceFps=cfg.fps;telemetry.streamReady=false;telemetry.state="SEARCHING";++telemetry.seq;}
-        std::uint64_t frameNo=0;int winFrames=0;double procFps=0.0,trackCap=0.0,trackSeconds=0.0;
-        auto winStart=std::chrono::steady_clock::now(); bool lastAi=false;
-        if(preview) localDisplay=std::make_unique<AsyncLocalDisplay>();
-        std::cout<<"[VISION] capture loop START; waiting for first CSI frame\n";
-        while(!g_stop && detRequest.load()){
-            cv::Mat frame;if(!cap.read(frame)||frame.empty()){std::cerr<<"[VISION] CSI frame read failed\n";break;}
+
+        {
+            std::lock_guard<std::mutex> l(telemetry.mutex);
+            telemetry.detActive=true;
+            telemetry.aiReady=aiReady;
+            telemetry.sourceFps=cfg.fps;
+            telemetry.streamReady=false;
+            telemetry.state="SEARCHING";
+            ++telemetry.seq;
+        }
+
+        std::uint64_t frameNo=0;
+        int winFrames=0;
+        double procFps=0.0,trackCap=0.0,trackSeconds=0.0;
+        auto winStart=std::chrono::steady_clock::now();
+        bool lastAi=false;
+
+        std::uint64_t lastRawSeq=0;
+        std::cout<<"[VISION] detector loop START; consuming latest RAW frame only\n";
+
+        while(!g_stop && detRequest.load(std::memory_order_acquire) &&
+              !cameraFault.load(std::memory_order_acquire)){
+            cv::Mat frame;
+            std::uint64_t rawSeq=0;
+            if(!rawLatest.get(frame,rawSeq) || rawSeq==lastRawSeq){
+                std::this_thread::sleep_for(1ms);
+                continue;
+            }
+
+            // Skip any stale intermediate RAW frames automatically.
+            lastRawSeq=rawSeq;
             ++frameNo;++winFrames;
-            if(frameNo==1) std::cout<<"[VISION] first CSI frame RECEIVED\n";
+            if(frameNo==1)
+                std::cout<<"[VISION] first latest RAW frame CONSUMED\n";
+
             const bool wantAi=aiReady && aiRequest.load();
-            if(wantAi!=lastAi){tracker->setAiEnabled(wantAi);lastAi=wantAi;std::cout<<"[AI] "<<(wantAi?"ON":"OFF")<<"\n";}
+            if(wantAi!=lastAi){
+                tracker->setAiEnabled(wantAi);
+                lastAi=wantAi;
+                std::cout<<"[AI] "<<(wantAi?"ON":"OFF")<<"\n";
+            }
+
             const auto t0=std::chrono::steady_clock::now();
             TrackResult r=tracker->process(frame);
             const auto t1=std::chrono::steady_clock::now();
             if(frameNo==1) std::cout<<"[VISION] first detector result READY\n";
+
             trackSeconds+=std::chrono::duration<double>(t1-t0).count();
             const double wall=std::chrono::duration<double>(t1-winStart).count();
-            if(wall>=0.5){procFps=winFrames/wall;trackCap=winFrames/std::max(1e-6,trackSeconds);winFrames=0;trackSeconds=0;winStart=t1;}
+            if(wall>=0.5){
+                procFps=winFrames/wall;
+                trackCap=winFrames/std::max(1e-6,trackSeconds);
+                winFrames=0;trackSeconds=0;winStart=t1;
+            }
+
             cv::Mat finalFrame=composeOutput(frame,r,procFps,cfg.fps,trackCap,int(frameNo));
             if(frameNo==1) std::cout<<"[VISION] first FINAL annotated frame COMPOSED\n";
             latest.put(finalFrame,frameNo);
+
             if(!streamReady.exchange(true)){
                 {
                     std::lock_guard<std::mutex> l(telemetry.mutex);
                     telemetry.streamReady=true;
                     ++telemetry.seq;
                 }
+                // Ground waits for streamReady before DESCRIBE.
                 std::cout<<"[RTSP] first final frame READY; remote RTSP may connect now\n";
-                rtsp.resetClients();
             }
+
             {
-                std::lock_guard<std::mutex> l(telemetry.mutex);++telemetry.seq;telemetry.detActive=true;telemetry.aiRequested=aiRequest.load();telemetry.aiReady=aiReady;
-                telemetry.aiActive=r.gdinoOn&&r.sam2On;telemetry.targetValid=r.guidanceValid;telemetry.x=r.guidanceValid?int(std::lround(r.guidance.errorX)):0;
-                telemetry.y=r.guidanceValid?int(std::lround(r.guidance.errorY)):0;telemetry.procFps=procFps;telemetry.sourceFps=cfg.fps;telemetry.frameNo=frameNo;telemetry.state=stateName(r.state);
+                std::lock_guard<std::mutex> l(telemetry.mutex);
+                ++telemetry.seq;
+                telemetry.detActive=true;
+                telemetry.aiRequested=aiRequest.load();
+                telemetry.aiReady=aiReady;
+                telemetry.aiActive=r.gdinoOn&&r.sam2On;
+                telemetry.targetValid=r.guidanceValid;
+                telemetry.x=r.guidanceValid?int(std::lround(r.guidance.errorX)):0;
+                telemetry.y=r.guidanceValid?int(std::lround(r.guidance.errorY)):0;
+                telemetry.procFps=procFps;
+                telemetry.sourceFps=cfg.fps;
+                telemetry.frameNo=frameNo;
+                telemetry.state=stateName(r.state);
             }
-            // Local preview is diagnostic only. At 60-Hz camera input submit at
-            // most 30 FPS to a one-slot worker; it can never back-pressure vision.
+
             if(preview && localDisplay && (frameNo==1 || (frameNo%2)==0))
                 localDisplay->submit(finalFrame);
         }
-        streamReady=false;
-        tracker->setAiEnabled(false);tracker.reset();cap.release();detActive=false;aiRequest=false;latest.clear();rtsp.resetClients();
+
+        // Stop the dedicated CSI owner before cap.release().  This guarantees
+        // only one thread ever touches VideoCapture during its lifetime.
+        captureRunning.store(false,std::memory_order_release);
+        if(cameraThread.joinable()) cameraThread.join();
+
+        const std::uint64_t captured=capturedSeq.load(std::memory_order_acquire);
+        const std::uint64_t skipped=captured>frameNo?captured-frameNo:0;
+        std::cout<<"[CAM] session frames captured="<<captured
+                 <<" processed="<<frameNo
+                 <<" stale-overwritten="<<skipped<<"\n";
+
+        // One orderly camera teardown per Detection session.  Never re-open in
+        // a tight loop after Argus reports a fault.
+        streamReady.store(false);
+        tracker->setAiEnabled(false);
+        aiRequest.store(false);
+        rawLatest.clear();
+        latest.clear();
+        rtsp.resetClients();
+        cap.release();
+        std::this_thread::sleep_for(500ms); // give Argus time to release CaptureSession
+        tracker.reset();
+        detActive=false;
+
         if(localDisplay){localDisplay->stop();localDisplay.reset();}
-        {std::lock_guard<std::mutex> l(telemetry.mutex);++telemetry.seq;telemetry.detActive=false;telemetry.aiRequested=false;telemetry.aiReady=false;telemetry.aiActive=false;telemetry.targetValid=false;telemetry.streamReady=false;telemetry.x=telemetry.y=0;telemetry.procFps=0;telemetry.frameNo=0;telemetry.state="OFF";}
-        std::cout<<"[VISION] DET OFF: CSI, detector, AI and RTSP media stopped\n";
+
+        {
+            std::lock_guard<std::mutex> l(telemetry.mutex);
+            ++telemetry.seq;
+            telemetry.detActive=false;
+            telemetry.aiRequested=false;
+            telemetry.aiReady=false;
+            telemetry.aiActive=false;
+            telemetry.targetValid=false;
+            telemetry.streamReady=false;
+            telemetry.x=telemetry.y=0;
+            telemetry.procFps=0;
+            telemetry.sourceFps=cfg.fps;
+            telemetry.frameNo=0;
+            telemetry.state=cameraFault.load()?"CAMERA_ERROR":"OFF";
+        }
+
+        if(cameraFault.load())
+            std::cout<<"[VISION] CAMERA_ERROR latched. Waiting for an explicit new DET ON command.\n";
+        else
+            std::cout<<"[VISION] DET OFF: CSI, detector, AI and RTSP media stopped cleanly\n";
     }
-    detRequest=false;aiRequest=false;detActive=false;streamReady=false;latest.clear();rtsp.resetClients();control.stop();rtsp.stop();
+
+    detRequest=false;aiRequest=false;detActive=false;streamReady=false;
+    latest.clear();rtsp.resetClients();control.stop();rtsp.stop();
     if(localDisplay){localDisplay->stop();localDisplay.reset();}
     return 0;
 }

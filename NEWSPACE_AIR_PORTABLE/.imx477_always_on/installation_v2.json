@@ -1,0 +1,8 @@
+{
+  "backup": "/home/gw_jetson_01/NEWSPACE_AIR_PORTABLE/.imx477_always_on/backups/20261012_153757",
+  "root": "/home/gw_jetson_01/NEWSPACE_AIR_PORTABLE",
+  "runner": "/home/gw_jetson_01/NEWSPACE_AIR_PORTABLE/run_core.sh",
+  "created_runner_copy": false,
+  "version": "NEWSPACE_ALWAYS_ON_IMX477_V2",
+  "installed_unix": 1791799677.146691
+}
